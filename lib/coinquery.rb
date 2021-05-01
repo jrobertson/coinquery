@@ -8,6 +8,8 @@ require 'json'
 require 'excon'
 require 'unichron'
 require 'did_you_mean'
+require 'recordx_sqlite'
+
 
 
 class CoinQueryException < Exception
@@ -18,9 +20,11 @@ class CoinQuery
 
   attr_reader :list
 
-  def initialize(autofind: true, dym: true, debug: false)
+  def initialize(autofind: true, dym: true, timeout: 5, filepath: '.', 
+                 debug: false)
 
-    @autofind, @dym, @debug = autofind, dym, debug
+    @autofind, @dym, @timeout, @debug = autofind, dym, timeout, debug
+    @filepath = filepath
 
     @url_base = 'https://api.coingecko.com/api/v3/'
     r = ping()
@@ -54,14 +58,14 @@ class CoinQuery
 
         if not File.exists? file then
 
-          File.open(file, 'w+') do |f|  
+          File.open(File.join(@filepath, file), 'w+') do |f|  
            Marshal.dump([@list, @dym], f)  
           end 
 
         else
         
           puts ('loading coins list ...').info  
-          File.open(file) do |f|  
+          File.open(File.join(@filepath, file)) do |f|  
             @list, @dym = Marshal.load(f)  
           end
     
@@ -69,7 +73,33 @@ class CoinQuery
 
       end
     end
+    
+    @table = RecordxSqlite.new(File.join(@filepath, 'coinquery.db'), 
+      table: {coins: {id: '', cname: '', price: '', date: 0}})
+    
 
+  end
+  
+  # archives the cryptocurrency prices in a local sqlite database
+  # note: intended for archiving prices on a daily basis
+  # 
+  def archive(limit: 250)    
+        
+    puts 'archive: fetching coins ...'.info
+    a = coins(limit: limit)
+    
+    puts 'archive: saving to database ...'.info
+
+    a.each do |coin|
+      
+      uid = coin['id'] + Date.today.to_time.to_i.to_s
+      @table.create id: uid.to_s, cname: coin['name'], 
+          price: coin['current_price'].to_s, date: Date.today.to_time.to_i
+      
+    end
+    
+    puts 'archive: completed'.info
+    
   end
 
   # lists the top coins (limited to 5 by default)
@@ -83,6 +113,45 @@ class CoinQuery
   #
   def coins_list
     @list
+  end
+  
+  def find_coin(coin_name)
+
+    return coin_name unless @autofind
+
+    s = coin_name.to_s.downcase
+    puts 's: ' + s.inspect if @debug
+    r = @list.find {|coin| coin['symbol'].downcase == s || coin['name'].downcase == s}
+    puts 'r: ' + r.inspect if @debug
+    
+    if r.nil? then
+
+      if @dym then
+
+        suggestion = @dym.correct coin_name
+        raise CoinQueryException, "unknown coin or token name. \n"  \
+            + "Did you mean %s?" % [suggestion.first]
+
+      else
+
+        raise CoinQueryException, "unknown coin or token name."
+
+      end
+
+    end
+
+    r
+
+  end
+
+  def find_id(name)
+    r = find_coin(name)
+    r['id']
+  end  
+  
+  def find_name(s)
+    r = find_coin s
+    r['name']
   end
 
   # returns the price of a coin for a given historical date
@@ -121,6 +190,23 @@ class CoinQuery
       val < 1 ? val : val.round(2)
     end
   end
+  
+  # use the database archive to query the historical price of a coin
+  # e.g. query_archive :btc, '1 May 2021'
+  #
+  def query_archive(coin_name, rawdate)
+
+    uc = Unichron.new(rawdate.to_s, :little_endian)
+    raise 'invalid date' unless uc.valid?
+    date = uc.to_date
+    
+    coin_id = find_id coin_name    
+    
+    id = coin_id + date.to_time.to_i.to_s
+    r = @table.query "select * from coins where id == '#{id}'"
+    r.first if r
+    
+  end
 
 
   private
@@ -128,7 +214,7 @@ class CoinQuery
   def api_call(api_request)
     
     begin
-      Timeout::timeout(3){
+      Timeout::timeout(@timeout){
         response = Excon.get(@url_base + api_request)
         JSON.parse(response.body)
       }
@@ -139,35 +225,5 @@ class CoinQuery
     end
 
   end
-
-  def find_id(coin_name)
-
-    return coin_name unless @autofind
-
-    s = coin_name.to_s.downcase
-    puts 's: ' + s.inspect if @debug
-    r = @list.find {|coin| coin['symbol'].downcase == s || coin['name'].downcase == s}
-    puts 'r: ' + r.inspect if @debug
-    
-    if r.nil? then
-
-      if @dym then
-
-        suggestion = @dym.correct coin_name
-        raise CoinQueryException, "unknown coin or token name. \n"  \
-            + "Did you mean %s?" % [suggestion.first]
-
-      else
-
-        raise CoinQueryException, "unknown coin or token name."
-
-      end
-
-    end
-
-    r['id']
-
-  end
-
+  
 end
-
